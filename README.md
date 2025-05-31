@@ -44,9 +44,8 @@ project/
 ```bash
 brew install fastqc kallisto r
 pip install -U matplotlib pandas numpy seaborn scikit-learn
-Rscript -e "install.packages('optparse', repos='https://cloud.r-project.org'); \
-            if (!requireNamespace('BiocManager', quietly=TRUE)) install.packages('BiocManager'); \
-            BiocManager::install('DESeq2')"
+Rscript -e 'if (!requireNamespace("BiocManager", quietly=TRUE)) install.packages("BiocManager", repos="https://cloud.r-project.org/"); BiocManager::install("DESeq2")'
+Rscript -e 'install.packages("optparse", repos="https://cloud.r-project.org/")'
 ```
 
 </details>
