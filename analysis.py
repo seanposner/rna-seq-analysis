@@ -7,26 +7,17 @@ Overview:
     - Handles QC, quantification, DE analysis (via R/DESeq2), and result visualization.
 
 Pipeline Stages:
-    1. **Quality Control (QC):**
-        - Runs FastQC on each FASTQ file.
-        - Aggregates QC metrics using MultiQC.
-    2. **Quantification:**
-        - Runs Kallisto (paired-end, transcript-level) for each sample.
-        - Skips quantification if output already exists.
-    3. **Collation:**
-        - Extracts counts and TPM matrices from Kallisto output.
-        - Compiles per-sample metadata (parsed from folder names).
-    4. **Differential Expression:**
-        - Runs DESeq2 via Rscript (requires R/DESeq2/optparse).
-        - Outputs a table of log2 fold changes, p-values, etc.
-    5. **Visualization:**
-        - Generates PCA, volcano plots, and clustered heatmaps for key results.
+    1. Quality Control (QC): FastQC + MultiQC (skipped if already done)
+    2. Quantification: Kallisto (paired-end, transcript-level, skipped if abundance.tsv exists)
+    3. Collation: Extract count/TPM matrices and per-sample metadata (from folder names)
+    4. Differential Expression: DESeq2 in R (requires optparse, DESeq2)
+    5. Visualization: PCA, volcano, heatmaps
 
 Folder Structure Example:
     Analysis/
         analysis.py
         fastqc/
-            CTRL-BT-BSA-1/    # (Contains .fastq.gz files)
+            CTRL-BT-BSA-1/    # Contains .fastq.gz files
             sh-MDA-TNF-22/
             ...
         refs/
@@ -45,7 +36,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -65,9 +56,9 @@ FASTQC_EXE   = shutil.which("fastqc")   or "fastqc"
 MULTIQC_EXE  = shutil.which("multiqc")  or "multiqc"
 KALLISTO_EXE = shutil.which("kallisto") or "kallisto"
 
-# Updated regex to handle both "CTRL-BT-BSA-1" and "sh-BT-BSA-7"
+# Accepts both CTRL-BT-BSA-1 and sh-BT-BSA-7 and KD-BT-BSA-7
 SAMPLE_ID_PATTERN = re.compile(
-    r"^(CTRL|KD|sh)[-_](BT|MDA)[-_](BSA|TNF)[-_](\d+)$", re.IGNORECASE
+    r"^(CTRL|KD|SH)[-_](BT|MDA)[-_](BSA|TNF)[-_](\d+)$", re.IGNORECASE
 )
 
 def _assert_tool(name: str, exe: str):
@@ -103,7 +94,6 @@ def multiqc_on_qc(qc_dir: Path, out: Path):
 def kallisto_quant(sample: str, fq_dir: Path, out: Path):
     out.mkdir(parents=True, exist_ok=True)
     fq_files = sorted(fq_dir.glob("*.fastq.gz"))
-    # Only run Kallisto if not already run (abundance.tsv exists)
     abun_file = out / "abundance.tsv"
     if abun_file.exists():
         print(f"[SKIP] Quant already exists for {sample}")
@@ -124,17 +114,21 @@ def kallisto_quant(sample: str, fq_dir: Path, out: Path):
 def parse_sample_id(sample_dir_name: str) -> Dict[str, str]:
     """
     Parse sample folder name into metadata.
-    Handles both "CTRL-BT-BSA-1" and "sh-BT-BSA-7" formats.
+    Handles both "CTRL-BT-BSA-1", "KD-BT-BSA-7", and "sh-BT-BSA-7" formats.
+    Always returns 'KD' for KD/SH, and 'CTRL' for controls.
     """
     m = SAMPLE_ID_PATTERN.match(sample_dir_name)
     if not m:
         raise ValueError(
             f"Bad sample ID '{sample_dir_name}'. Expected: "
-            "CTRL|KD|sh-BT|MDA-BSA|TNF-#"
+            "CTRL|KD|SH-BT|MDA-BSA|TNF-#"
         )
+    group = m.group(1).upper()
+    # Map 'SH' to 'KD' for analysis consistency
+    brca1_kd = "KD" if group in ("KD", "SH") else "CTRL"
     return {
         "sample": sample_dir_name,
-        "brca1_kd": m.group(1).upper(),      # CTRL, KD, or sh
+        "brca1_kd": brca1_kd,                # Only "CTRL" or "KD"
         "cell_line": m.group(2).upper(),     # BT, MDA
         "tnf": m.group(3).upper(),           # BSA, TNF
         "rep": m.group(4)
@@ -172,6 +166,8 @@ def build_matrices(quant_dir: Path):
     if not counts:
         sys.exit("[ERROR] No valid Kallisto quantification results found in quant/. Aborting.")
     meta = pd.DataFrame(meta_rows).set_index("sample")
+    # Map SH->KD again just in case (meta file for R)
+    meta["brca1_kd"] = meta["brca1_kd"].replace({"SH": "KD"})
     return pd.concat(counts, axis=1), pd.concat(tpms, axis=1), meta
 
 # ---- Differential Expression with R/DESeq2 ----
@@ -179,7 +175,6 @@ def build_matrices(quant_dir: Path):
 DESEQ2_R_SCRIPT = ROOT / "deseq2_deseq_contrast.R"
 
 def write_deseq2_r():
-    # Write an R script to run DESeq2 DE analysis
     DESEQ2_R_SCRIPT.write_text("""
 suppressMessages(library("optparse"))
 suppressMessages(library("DESeq2"))
@@ -221,7 +216,6 @@ def run_deseq2_r(counts_path, meta_path, factor, test, ref, out_path):
     _run(cmd)
 
 def pca_plot(vst: pd.DataFrame, meta: pd.DataFrame, out: Path):
-    from sklearn.decomposition import PCA
     pcs: np.ndarray = PCA(n_components=2).fit_transform(vst.T)
     fig, ax = plt.subplots(figsize=(5, 4))
     for (brca, tnf, line), grp in meta.groupby(["brca1_kd", "tnf", "cell_line"]):
@@ -240,8 +234,8 @@ def volcano_plot(de: pd.DataFrame, out: Path, alpha: float = 0.05):
     fig, ax = plt.subplots(figsize=(5, 5))
     ax.scatter(de["log2FoldChange"], de["nlp10"], s=8, alpha=.5)
     ax.axhline(-np.log10(alpha), linestyle="--", color="grey")
-    ax.set_xlabel("log2 fold‑change")
-    ax.set_ylabel("-log10 adj‑p")
+    ax.set_xlabel("log2 fold-change")
+    ax.set_ylabel("-log10 adj-p")
     fig.tight_layout()
     fig.savefig(out, dpi=300)
     plt.close(fig)
@@ -250,10 +244,7 @@ def heatmap(vst: pd.DataFrame, meta: pd.DataFrame, genes: List[str], out: Path):
     data = vst.loc[genes].dropna()
     annot = meta[["cell_line", "brca1_kd", "tnf"]].copy()
     lut = {'CTRL': 'blue', 'KD': 'red', 'BSA': 'grey', 'TNF': 'orange', 'BT': 'green', 'MDA': 'purple'}
-
-    # Apply color mapping column-wise and ensure result is a DataFrame
     col_colors = annot.apply(lambda col: col.map(lambda x: lut.get(x, "black")))
-
     g = sns.clustermap(data, cmap="vlag", z_score=0, col_colors=col_colors)
     plt.savefig(out, dpi=300)
     plt.close()
