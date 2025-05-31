@@ -39,7 +39,7 @@ project/
 | CLI tools    | `fastqc`, `multiqc`, `kallisto`                |
 
 <details>
-<summary>Quick install (Homebrew + pip)</summary>
+<summary>Quick install (Mac)</summary>
 
 ```bash
 brew install fastqc kallisto r

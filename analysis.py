@@ -267,23 +267,27 @@ def main():
     PLOTS_DIR.mkdir(exist_ok=True)
     QUANT_DIR.mkdir(exist_ok=True)
 
-    print("[STEP] FastQC …")
-    for sample_dir in sorted(FASTQC_DIR.iterdir()):
-        if not sample_dir.is_dir():
-            continue
-        # Skip unzipping if files already exist
-        fastqc_dirwise(sample_dir, sample_dir / "qc")
-    multiqc_on_qc(FASTQC_DIR, RESULTS_DIR / "multiqc")
+    print("[STEP] QC")
+    multiqc_report = RESULTS_DIR / "multiqc" / "multiqc_report.html"
+    if multiqc_report.exists():
+        print(f"[SKIP] FastQC & MultiQC already completed: {multiqc_report}")
+    else:
+        for sample_dir in sorted(FASTQC_DIR.iterdir()):
+            if not sample_dir.is_dir():
+                continue
+            fastqc_dirwise(sample_dir, sample_dir / "qc")
+        multiqc_on_qc(FASTQC_DIR, RESULTS_DIR / "multiqc")
 
-    print("[STEP] Kallisto quant …")
+    print("[STEP] Kallisto quant")
     for sample_dir in sorted(FASTQC_DIR.iterdir()):
         if not sample_dir.is_dir():
             continue
         outdir = QUANT_DIR / sample_dir.name
         kallisto_quant(sample_dir.name, sample_dir, outdir)
 
-    print("[STEP] Collate counts …")
+    print("[STEP] Collate counts")
     counts, tpms, meta = build_matrices(QUANT_DIR)
+    counts = counts.round().astype(int)
     counts_tsv = RESULTS_DIR / "gene_counts.tsv"
     tpms_tsv = RESULTS_DIR / "gene_tpms.tsv"
     meta_tsv = RESULTS_DIR / "sample_meta.tsv"
@@ -291,13 +295,13 @@ def main():
     tpms.to_csv(tpms_tsv, sep="\t")
     meta.to_csv(meta_tsv, sep="\t")
 
-    print("[STEP] Differential expression …")
+    print("[STEP] Differential expression")
     de_out = RESULTS_DIR / "DE_KD_vs_CTRL.tsv"
     run_deseq2_r(counts_tsv, meta_tsv, "brca1_kd", "KD", "CTRL", de_out)
     de_kd = pd.read_csv(de_out, sep="\t")
 
     vst = vst_log2(counts)
-    print("[STEP] Figures …")
+    print("[STEP] Figures")
     pca_plot(vst, meta, PLOTS_DIR / "pca.png")
     volcano_plot(de_kd, PLOTS_DIR / "volcano_kd_vs_ctrl.png")
     sig_genes = de_kd.query("padj < 0.05 & abs(log2FoldChange) > 1")["gene"].tolist()[:50]
