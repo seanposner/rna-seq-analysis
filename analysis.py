@@ -45,7 +45,7 @@ import seaborn as sns
 from sklearn.decomposition import PCA
 
 ROOT          = Path(__file__).resolve().parent
-THREADS       = int(os.getenv("THREADS", os.cpu_count() or 4))
+THREADS       = 4
 KALLISTO_IDX  = ROOT / "refs" / "grch38-cdna-kallisto.idx"
 RESULTS_DIR   = ROOT / "results"
 PLOTS_DIR     = ROOT / "plots"
@@ -91,25 +91,68 @@ def multiqc_on_qc(qc_dir: Path, out: Path):
     out.mkdir(parents=True, exist_ok=True)
     _run([MULTIQC_EXE, str(qc_dir), "--outdir", str(out)])
 
-def kallisto_quant(sample: str, fq_dir: Path, out: Path):
-    out.mkdir(parents=True, exist_ok=True)
-    fq_files = sorted(fq_dir.glob("*.fastq.gz"))
-    abun_file = out / "abundance.tsv"
-    if abun_file.exists():
-        print(f"[SKIP] Quant already exists for {sample}")
-        return
-    if len(fq_files) == 2:
-        cmd = [
-            str(KALLISTO_EXE), "quant",
-            "-i", str(KALLISTO_IDX),
-            "-o", str(out),
-            "-b", "100",
-            "-t", str(THREADS),
-            str(fq_files[0]), str(fq_files[1])
-        ]
-    else:
-        sys.exit(f"[ERROR] Expected 2 FASTQ files for paired-end: {fq_dir}")
-    _run(cmd)
+def umi_extract_and_dedup(sample_name, r1_path, r2_path, star_index, output_dir, annotation_gtf, threads=4):
+    """
+    UMI-aware processing of a sample.
+    - Extracts UMIs using UMI-tools from R2, appends to R1 header.
+    - Aligns reads with STAR.
+    - Deduplicates reads using UMI-tools.
+    - Counts features using featureCounts.
+    """
+    from pathlib import Path
+    import subprocess
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True, parents=True)
+    extracted_r1 = output_dir / f"{sample_name}_R1_extracted.fastq.gz"
+    aligned_bam = output_dir / f"{sample_name}_Aligned.sortedByCoord.out.bam"
+    dedup_bam = output_dir / f"{sample_name}_dedup.bam"
+    counts_txt = output_dir / f"{sample_name}_counts.txt"
+
+    # 1. UMI extraction
+    subprocess.run([
+        "umi_tools", "extract",
+        "--bc-pattern=NNNNNNNN",  # 8bp UMI, update if needed
+        "-I", str(r1_path),
+        "--read2-in", str(r2_path),
+        "-S", str(extracted_r1)
+    ], check=True)
+
+    # 2. STAR alignment
+    subprocess.run([
+        "STAR",
+        "--runThreadN", str(threads),
+        "--genomeDir", str(star_index),
+        "--readFilesIn", str(extracted_r1),
+        "--readFilesCommand", "gunzip", "-c",
+        "--outFileNamePrefix", str(output_dir / f"{sample_name}_"),
+        "--outSAMtype", "BAM", "SortedByCoordinate"
+    ], check=True)
+
+    star_bam = output_dir / f"{sample_name}_Aligned.sortedByCoord.out.bam"
+    
+    # 2.5. Index the BAM
+    subprocess.run([
+        "samtools", "index", str(star_bam)
+    ], check=True)
+
+    # 3. Deduplication with UMI-tools
+    subprocess.run([
+        "umi_tools", "dedup",
+        "-I", str(star_bam),
+        "-S", str(dedup_bam)
+    ], check=True)
+
+    # 4. Quantification with featureCounts
+    subprocess.run([
+        "featureCounts",
+        "-T", str(threads),
+        "-a", str(annotation_gtf),
+        "-o", str(counts_txt),
+        str(dedup_bam)
+    ], check=True)
+
+    return counts_txt
 
 def parse_sample_id(sample_dir_name: str) -> Dict[str, str]:
     """
@@ -134,42 +177,6 @@ def parse_sample_id(sample_dir_name: str) -> Dict[str, str]:
         "rep": m.group(4)
     }
 
-def import_kallisto_quant(qdir: Path) -> pd.DataFrame:
-    df = pd.read_csv(qdir / "abundance.tsv", sep="\t").set_index("target_id")
-    return df[["est_counts", "tpm"]].rename(columns={"est_counts": "counts"})
-
-def build_matrices(quant_dir: Path):
-    counts, tpms, meta_rows = [], [], []
-    detected = []
-    for qdir in sorted(quant_dir.iterdir()):
-        abun = qdir / "abundance.tsv"
-        if not abun.exists():
-            print(f"[WARN] Skipping {qdir.name} (missing abundance.tsv)")
-            continue
-        sample = qdir.name
-        try:
-            meta = parse_sample_id(sample)
-            detected.append(sample)
-        except Exception as e:
-            print(f"[SKIP] {sample}: {e}")
-            continue
-        meta_rows.append(meta)
-        try:
-            df = import_kallisto_quant(qdir)
-            counts.append(df["counts"].rename(sample))
-            tpms.append(df["tpm"].rename(sample))
-        except Exception as e:
-            print(f"[WARN] Failed to load quant for {sample}: {e}")
-    print(f"\n[INFO] {len(detected)} samples with quantification found:")
-    for s in detected:
-        print(f"  - {s}")
-    if not counts:
-        sys.exit("[ERROR] No valid Kallisto quantification results found in quant/. Aborting.")
-    meta = pd.DataFrame(meta_rows).set_index("sample")
-    # Map SH->KD again just in case (meta file for R)
-    meta["brca1_kd"] = meta["brca1_kd"].replace({"SH": "KD"})
-    return pd.concat(counts, axis=1), pd.concat(tpms, axis=1), meta
-
 # ---- Differential Expression with R/DESeq2 ----
 
 DESEQ2_R_SCRIPT = ROOT / "deseq2_deseq_contrast.R"
@@ -185,7 +192,8 @@ option_list <- list(
   make_option(c("--factor"), type="character", help="test factor"),
   make_option(c("--test"), type="character", help="test level"),
   make_option(c("--ref"), type="character", help="ref level"),
-  make_option(c("--out"), type="character", help="output tsv")
+  make_option(c("--deout"), type="character", help="output DE tsv"),
+  make_option(c("--vstout"), type="character", help="output VST tsv")
 )
 opt <- parse_args(OptionParser(option_list=option_list))
 
@@ -199,10 +207,15 @@ dds <- DESeq(dds)
 res <- results(dds, contrast=c(opt$factor, opt$test, opt$ref))
 res <- as.data.frame(res)
 res$gene <- rownames(res)
-write.table(res, file=opt$out, sep="\\t", quote=FALSE, row.names=FALSE)
+write.table(res, file=opt$deout, sep="\\t", quote=FALSE, row.names=FALSE)
+
+# VST matrix
+vst <- vst(dds)
+vst_mat <- assay(vst)
+write.table(vst_mat, file=opt$vstout, sep="\\t", quote=FALSE)
     """.strip())
 
-def run_deseq2_r(counts_path, meta_path, factor, test, ref, out_path):
+def run_deseq2_r(counts_path, meta_path, factor, test, ref, de_out_path, vst_out_path):
     write_deseq2_r()
     cmd = [
         "Rscript", str(DESEQ2_R_SCRIPT),
@@ -211,7 +224,8 @@ def run_deseq2_r(counts_path, meta_path, factor, test, ref, out_path):
         "--factor", factor,
         "--test", test,
         "--ref", ref,
-        "--out", str(out_path)
+        "--deout", str(de_out_path),
+        "--vstout", str(vst_out_path)
     ]
     _run(cmd)
 
@@ -258,10 +272,14 @@ def main():
     PLOTS_DIR.mkdir(exist_ok=True)
     QUANT_DIR.mkdir(exist_ok=True)
 
+    # ---- Paths to STAR and GTF ----
+    STAR_INDEX = ROOT / "refs" / "star"
+    ANNOTATION_GTF = ROOT / "refs" / "gencode.v45.annotation.gtf"
+
     print("[STEP] QC")
     multiqc_report = RESULTS_DIR / "multiqc" / "multiqc_report.html"
     if multiqc_report.exists():
-        print(f"[SKIP] FastQC & MultiQC already completed: {multiqc_report}")
+        print(f"[SKIP] FastQC & MultiQC already completed: {multiqc_report})")
     else:
         for sample_dir in sorted(FASTQC_DIR.iterdir()):
             if not sample_dir.is_dir():
@@ -269,31 +287,78 @@ def main():
             fastqc_dirwise(sample_dir, sample_dir / "qc")
         multiqc_on_qc(FASTQC_DIR, RESULTS_DIR / "multiqc")
 
-    print("[STEP] Kallisto quant")
+    print("[STEP] UMI-aware quantification (STAR + UMI-tools + featureCounts)")
+    counts_files = []
+    meta_rows = []
     for sample_dir in sorted(FASTQC_DIR.iterdir()):
         if not sample_dir.is_dir():
             continue
-        outdir = QUANT_DIR / sample_dir.name
-        kallisto_quant(sample_dir.name, sample_dir, outdir)
+        sample_name = sample_dir.name
+        outdir = QUANT_DIR / sample_name
+        counts_txt = outdir / f"{sample_name}_counts.txt"
+        if counts_txt.exists():
+            print(f"[SKIP] {sample_name}: already quantified.")
+            counts_files.append((sample_name, counts_txt))
+            try:
+                meta = parse_sample_id(sample_name)
+                meta_rows.append(meta)
+            except Exception as e:
+                print(f"[SKIP META] {sample_name}: {e}")
+            continue
+        fq_r1 = sorted(sample_dir.glob("*R1*.fastq.gz"))
+        fq_r2 = sorted(sample_dir.glob("*R2*.fastq.gz"))
+        if len(fq_r1) != 1 or len(fq_r2) != 1:
+            print(f"[WARN] Skipping {sample_name}: Need exactly 1 R1 and 1 R2 FASTQ")
+            continue
+        counts_txt = umi_extract_and_dedup(
+            sample_name, fq_r1[0], fq_r2[0],
+            STAR_INDEX, outdir, ANNOTATION_GTF, threads=THREADS
+        )
+        counts_files.append((sample_name, counts_txt))
+        try:
+            meta = parse_sample_id(sample_name)
+            meta_rows.append(meta)
+        except Exception as e:
+            print(f"[SKIP META] {sample_name}: {e}")
 
     print("[STEP] Collate counts")
-    counts, tpms, meta = build_matrices(QUANT_DIR)
-    counts = counts.round().astype(int)
+    all_counts = []
+    for sample_name, counts_txt in counts_files:
+        # Parse featureCounts output (skip header lines, grab first sample column)
+        df = pd.read_csv(counts_txt, sep='\t', comment='#')
+        if sample_name not in df.columns:
+            # fallback: try last column (featureCounts sometimes labels with full path)
+            sample_col = df.columns[-1]
+        else:
+            sample_col = sample_name
+        df = df.set_index('Geneid')[[sample_col]]
+        df.columns = [sample_name]
+        all_counts.append(df)
+    if not all_counts:
+        sys.exit("[ERROR] No quantification results found. Aborting.")
+    counts = pd.concat(all_counts, axis=1)
+    counts = counts.loc[~counts.index.str.startswith('__')]  # Remove summary rows
+
+    meta = pd.DataFrame(meta_rows).set_index("sample")
     counts_tsv = RESULTS_DIR / "gene_counts.tsv"
-    tpms_tsv = RESULTS_DIR / "gene_tpms.tsv"
     meta_tsv = RESULTS_DIR / "sample_meta.tsv"
     counts.to_csv(counts_tsv, sep="\t")
-    tpms.to_csv(tpms_tsv, sep="\t")
     meta.to_csv(meta_tsv, sep="\t")
 
-    print("[STEP] Differential expression")
+    print("[STEP] Differential expression + VST")
     de_out = RESULTS_DIR / "DE_KD_vs_CTRL.tsv"
-    run_deseq2_r(counts_tsv, meta_tsv, "brca1_kd", "KD", "CTRL", de_out)
+    vst_out = RESULTS_DIR / "vst_counts.tsv"
+    run_deseq2_r(counts_tsv, meta_tsv, "brca1_kd", "KD", "CTRL", de_out, vst_out)
     de_kd = pd.read_csv(de_out, sep="\t")
+    vst = pd.read_csv(vst_out, sep="\t", index_col=0)
 
-    vst = vst_log2(counts)
+    # Filter to variable genes for PCA (optional but helps!)
+    variances = vst.var(axis=1)
+    top_genes = variances.nlargest(500).index
+    vst_top = vst.loc[top_genes]
+
     print("[STEP] Figures")
-    pca_plot(vst, meta, PLOTS_DIR / "pca.png")
+    pca_plot(vst_top, meta, PLOTS_DIR / "pca.png")
     volcano_plot(de_kd, PLOTS_DIR / "volcano_kd_vs_ctrl.png")
     sig_genes = de_kd.query("padj < 0.05 & abs(log2FoldChange) > 1")["gene"].tolist()[:50]
     if sig_genes:
