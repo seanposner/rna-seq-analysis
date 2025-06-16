@@ -77,7 +77,12 @@ gunzip gencode.v36.annotation.gtf.gz
 
 ```bash
 pip install gsutil  # if not present
-gsutil -m cp -r gs://gcp-public-data--broad-references/hg38/v0/star/GRCh38_gencode_v36_sjdb100 ./star_index
+gsutil -m cp -r gs://gcp-public-data--broad-references/hg38/v0/star/<STAR_INDEX> ./star_index
+```
+
+Where the STAR_INDEX can be:
+```
+star_2.7.9a_primary_gencode_human_v27.tar
 ```
 
 ### Option 3: Build Your Own (Advanced)
